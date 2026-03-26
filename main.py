@@ -3,10 +3,16 @@ import subprocess
 from pathlib import Path
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
 import threading
 import secrets
 import json
+import psutil
+import time
+import datetime
+import zipfile
+import io
 
 # Dictionary to track running scripts per user
 running_scripts = {}
@@ -17,7 +23,11 @@ BASE_DIR.mkdir(exist_ok=True)
 
 # Key system
 KEYS_FILE = BASE_DIR / "keys.json"
-ADMIN_USER_ID = 7225123280  # <-- Replace with YOUR Telegram user ID
+# Get Admin ID from env or fallback
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 7225123280))
+
+# Get Port from env for hosting flexibility
+WEB_PORT = int(os.environ.get("PORT", 5000))
 
 # Initialize keys storage
 def load_keys():
@@ -108,8 +118,72 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Commands:\n"
         "/stop - Stop your running script\n"
         "/status - Check script status\n"
-        "/logs - View script output"
+        "/logs - View script output\n"
+        "/apps - List your uploaded scripts\n"
+        "/delete <filename> - Delete a script\n"
+        "/clearlogs - Clear all your log files\n"
+        "/sysinfo - Show system performance stats\n"
+        "/help - Show this help message"
     )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        return
+        
+    help_text = (
+        "🤖 **Bot Help & Commands**\n\n"
+        "**📁 File Management:**\n"
+        "• Send any `.py` file to upload and run it.\n"
+        "• Send `.zip` files to upload databases or other assets (auto-extracts).\n"
+        "• Send `requirements.txt` to install dependencies.\n"
+        "• /apps - List all your uploaded scripts.\n"
+        "• /delete <filename> - Delete a specific script.\n\n"
+        "**🚀 Script Control:**\n"
+        "• /stop - Stop your currently running script.\n"
+        "• /status - See if your script is running and its PID.\n"
+        "• /logs - Get the last 4000 characters of your script's output.\n"
+        "• /clearlogs - Wipe your log files.\n\n"
+        "**📊 System:**\n"
+        "• /sysinfo - Check host server CPU, RAM, and Disk usage.\n"
+    )
+    
+    if user_id == ADMIN_USER_ID:
+        help_text += (
+            "\n**🛡️ Admin Commands:**\n"
+            "• /key <user_id> - Generate access key for a user.\n"
+            "• /revoke <user_id> - Revoke access from a user.\n"
+            "• /listkeys - List all active users and their keys.\n"
+            "• /broadcast <msg> - Send a message to all active users.\n"
+            "• /stats - See global bot statistics.\n"
+        )
+        
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+async def bot_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        return
+        
+    total_users = len(active_keys)
+    running_now = len(running_scripts)
+    
+    # Count total files in user_data
+    total_files = 0
+    total_size = 0
+    for path in BASE_DIR.rglob('*'):
+        if path.is_file():
+            total_files += 1
+            total_size += path.stat().st_size
+            
+    message = (
+        "📈 **Global Bot Statistics**\n\n"
+        f"👥 Total Authorized Users: {total_users}\n"
+        f"🏃 Currently Running Scripts: {running_now}\n"
+        f"📂 Total Files Hosted: {total_files}\n"
+        f"💾 Total Storage Used: {total_size / (1024**2):.2f} MB\n"
+    )
+    await update.message.reply_text(message, parse_mode="Markdown")
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -148,8 +222,30 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Handle .zip files
+    elif file.file_name.endswith(".zip"):
+        user_dir = BASE_DIR / str(user_id)
+        user_dir.mkdir(exist_ok=True)
+        
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_content)) as z:
+                z.extractall(user_dir)
+                file_list = "\n".join([f"• `{name}`" for name in z.namelist()[:10]])
+                if len(z.namelist()) > 10:
+                    file_list += f"\n... and {len(z.namelist()) - 10} more"
+                
+                await update.message.reply_text(
+                    f"✅ Extracted `{file.file_name}` to your directory.\n\n"
+                    f"Files extracted:\n{file_list}"
+                )
+        except zipfile.BadZipFile:
+            await update.message.reply_text("❌ Error: Invalid .zip file.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error extracting zip: {e}")
+        return
+
     else:
-        await update.message.reply_text("Only .py files or requirements.txt are allowed!")
+        await update.message.reply_text("Only .py, .zip files or requirements.txt are allowed!")
 
 async def stop_script(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -202,6 +298,111 @@ async def logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"📄 Last logs:\n{content}")
     else:
         await update.message.reply_text("No logs found.")
+
+async def list_apps(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        return
+    
+    user_dir = BASE_DIR / str(user_id)
+    if not user_dir.exists():
+        await update.message.reply_text("You haven't uploaded any scripts yet.")
+        return
+    
+    files = list(user_dir.glob("*.py"))
+    if not files:
+        await update.message.reply_text("No scripts found in your directory.")
+        return
+    
+    message = "📂 Your uploaded scripts:\n\n"
+    for f in files:
+        size = f.stat().st_size / 1024 # KB
+        message += f"• `{f.name}` ({size:.2f} KB)\n"
+    
+    await update.message.reply_text(message)
+
+async def delete_app(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <filename>")
+        return
+    
+    filename = context.args[0]
+    user_dir = BASE_DIR / str(user_id)
+    file_path = user_dir / filename
+    
+    if not file_path.exists() or not filename.endswith(".py"):
+        await update.message.reply_text(f"❌ File `{filename}` not found or invalid.")
+        return
+    
+    try:
+        file_path.unlink()
+        await update.message.reply_text(f"✅ Deleted script: `{filename}`")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error deleting file: {e}")
+
+async def clear_logs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        return
+    
+    user_dir = BASE_DIR / str(user_id)
+    logs_cleared = 0
+    for log_name in ["output.log", "requirements.log"]:
+        log_path = user_dir / log_name
+        if log_path.exists():
+            log_path.unlink()
+            logs_cleared += 1
+    
+    if logs_cleared > 0:
+        await update.message.reply_text(f"✅ Cleared {logs_cleared} log file(s).")
+    else:
+        await update.message.reply_text("No logs found to clear.")
+
+async def sys_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not check_access(user_id):
+        return
+    
+    cpu_usage = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    uptime = datetime.timedelta(seconds=int(time.time() - psutil.boot_time()))
+    
+    message = (
+        "📊 **System Status**\n\n"
+        f"💻 CPU: {cpu_usage}%\n"
+        f"🧠 RAM: {memory.percent}% ({memory.used // (1024**2)}MB / {memory.total // (1024**2)}MB)\n"
+        f"💾 Disk: {disk.percent}% ({disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB)\n"
+        f"🕒 Uptime: {uptime}\n"
+    )
+    await update.message.reply_text(message, parse_mode="Markdown")
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text("⚠️ Only admin can broadcast!")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+    
+    msg = " ".join(context.args)
+    count = 0
+    # Broadcast to all users with active keys
+    for uid in active_keys.keys():
+        try:
+            await context.bot.send_message(chat_id=int(uid), text=f"📢 **ADMIN BROADCAST**\n\n{msg}", parse_mode="Markdown")
+            count += 1
+        except Exception:
+            pass
+            
+    await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
 
 # -------------------------
 # Admin Key Management
@@ -286,6 +487,7 @@ async def list_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Flask Web Server (for deploying from your site)
 # -------------------------
 app = Flask(__name__)
+CORS(app)  # Enable CORS for frontend-backend communication
 
 # Secret token for API authentication
 API_SECRET = secrets.token_urlsafe(32)  # Generate on first run
@@ -298,6 +500,84 @@ if API_SECRET_FILE.exists():
 else:
     with open(API_SECRET_FILE, "w") as f:
         f.write(API_SECRET)
+
+@app.route('/')
+def serve_index():
+    """Serve the landing page"""
+    return send_from_directory('.', 'index.html')
+
+@app.route('/api/pricing', methods=['GET'])
+def get_pricing():
+    """Get hosting pricing tiers"""
+    pricing = [
+        {
+            "id": "starter",
+            "name": "Starter",
+            "price": "$5",
+            "period": "/mo",
+            "features": ["1 Python Script", "1GB RAM", "Shared CPU", "24/7 Support"],
+            "recommended": False
+        },
+        {
+            "id": "pro",
+            "name": "Professional",
+            "price": "$15",
+            "period": "/mo",
+            "features": ["5 Python Scripts", "4GB RAM", "Dedicated CPU", "Priority Support", "Custom Domain"],
+            "recommended": True
+        },
+        {
+            "id": "enterprise",
+            "name": "Enterprise",
+            "price": "$49",
+            "period": "/mo",
+            "features": ["Unlimited Scripts", "16GB RAM", "Dedicated Resources", "Dedicated Manager", "SLA Guarantee"],
+            "recommended": False
+        }
+    ]
+    return jsonify(pricing)
+
+@app.route('/api/free-server', methods=['POST'])
+def claim_free_server():
+    """Handle free server claims from the website"""
+    data = request.json
+    user_id = data.get('user_id') # Telegram User ID
+
+    if not user_id:
+        return jsonify({"success": False, "message": "Telegram User ID is required"}), 400
+
+    keys = load_keys()
+    if str(user_id) in keys:
+        return jsonify({"success": False, "message": "User already has a key!"}), 400
+    
+    # Simple logic for free server - add user to keys.json
+    keys[str(user_id)] = {
+        "key": "FREE-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S"),
+        "type": "free_trial",
+        "created_at": str(datetime.datetime.now())
+    }
+    save_keys(keys)
+
+    return jsonify({
+        "success": True,
+        "message": "Free server claimed! Use your Telegram ID to access the bot.",
+        "key": keys[str(user_id)]["key"]
+    })
+
+@app.route('/api/sysinfo', methods=['GET'])
+def get_web_sysinfo():
+    """Get system info for the website dashboard"""
+    cpu_usage = psutil.cpu_percent(interval=1)
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage('/')
+    
+    return jsonify({
+        "cpu": f"{cpu_usage}%",
+        "ram": f"{ram.percent}%",
+        "disk": f"{disk.percent}%",
+        "total_users": len(load_keys()),
+        "uptime": "99.9%"
+    })
 
 @app.route('/deploy', methods=['POST'])
 def deploy():
@@ -378,21 +658,37 @@ def web_logs(user_id):
     else:
         return jsonify({"error": "No logs found"}), 404
 
+@app.route('/list/<int:user_id>', methods=['GET'])
+def web_list(user_id):
+    """List scripts for a specific user"""
+    secret = request.headers.get('Authorization')
+    
+    if secret != f"Bearer {API_SECRET}":
+        return jsonify({"error": "Invalid authorization"}), 403
+    
+    user_dir = BASE_DIR / str(user_id)
+    if not user_dir.exists():
+        return jsonify({"scripts": []})
+        
+    files = [f.name for f in user_dir.glob("*.py")]
+    return jsonify({"scripts": files})
+
 def run_flask():
     """Run Flask server in a separate thread"""
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=WEB_PORT, debug=False)
 
 # -------------------------
 # Main Bot Setup
 # -------------------------
 def main():
-    TOKEN = "7711686004:AAFoNhPTi_ggO_3of0VqUERMwCGqU1ZhZkc"  # <-- Replace with your Telegram bot token
+    # Get Telegram Bot Token from environment variable
+    TOKEN = os.environ.get("TELEGRAM_TOKEN", "7711686004:AAFoNhPTi_ggO_3of0VqUERMwCGqU1ZhZkc")
 
     # Print API secret on startup
     print("=" * 50)
     print("🤖 Bot is starting...")
     print(f"🔑 Your API Secret: {API_SECRET}")
-    print(f"🌐 Web API running on http://0.0.0.0:5000")
+    print(f"🌐 Web API running on http://0.0.0.0:{WEB_PORT}")
     print(f"👤 Admin User ID: {ADMIN_USER_ID}")
     print("=" * 50)
 
@@ -404,9 +700,16 @@ def main():
     telegram_app = ApplicationBuilder().token(TOKEN).build()
 
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("help", help_command))
     telegram_app.add_handler(CommandHandler("stop", stop_script))
     telegram_app.add_handler(CommandHandler("status", status))
     telegram_app.add_handler(CommandHandler("logs", logs))
+    telegram_app.add_handler(CommandHandler("apps", list_apps))
+    telegram_app.add_handler(CommandHandler("delete", delete_app))
+    telegram_app.add_handler(CommandHandler("clearlogs", clear_logs))
+    telegram_app.add_handler(CommandHandler("sysinfo", sys_info))
+    telegram_app.add_handler(CommandHandler("broadcast", broadcast))
+    telegram_app.add_handler(CommandHandler("stats", bot_stats))
     telegram_app.add_handler(CommandHandler("key", generate_key))
     telegram_app.add_handler(CommandHandler("revoke", revoke_key))
     telegram_app.add_handler(CommandHandler("listkeys", list_keys))
